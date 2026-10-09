@@ -125,7 +125,7 @@ CTX_THRESHOLD_HIGH=85  # 第三档
 
 ## 工作原理
 
-1. **Stop hook** 在每次 Claude 回复后触发，读取 stdin payload 中的 `.context_window.used_percentage`
+1. **Stop hook** 在每次 Claude 回复后触发。Stop hook 的 payload 不带 context 百分比，脚本从 transcript 末尾取最后一条主线回复的 token 用量（`input + cache_creation + cache_read`，与 statusline 口径一致；compact 之后取压缩后的用量），再按窗口大小换算：`settings.json` 的 `model` 或 `ANTHROPIC_MODEL` 带 `[1m]` 后缀按 1M 算，否则按 200k
 2. 超过阈值时，向 stderr 输出彩色药丸（你在终端看到），向 stdout 输出 JSON `{systemMessage: "..."}` （Claude 读到）
 3. **Statusline** 每次 prompt 时重新渲染，持续显示当前 context 百分比
 4. **`/handoff` skill** 由用户手动触发，AI 盘点变更后生成交接摘要并复制到剪贴板
