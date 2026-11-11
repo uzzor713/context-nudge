@@ -3,7 +3,8 @@
 # 可独立使用，也可集成到已有 statusline 脚本中。
 set -uo pipefail
 
-# --- 可调参数（与 stop hook 保持一致）--------------------------------------
+# --- 可调参数 ---------------------------------------------------------------
+# 只决定百分比的颜色；「建议交接 / 立即交接」由 prompt hook 判定后写进状态文件。
 CTX_THRESHOLD_LOW=40
 CTX_THRESHOLD_MID=65
 CTX_THRESHOLD_HIGH=85
@@ -15,6 +16,7 @@ ctx_pct=$(printf '%.0f' "$ctx_pct" 2>/dev/null || echo 0)
 model=$(jq -r '.model.display_name // "Claude"' <<<"$payload")
 cwd=$(jq -r '.workspace.current_dir // "."' <<<"$payload")
 dirname=$(basename "$cwd")
+session_id=$(jq -r '.session_id // empty' <<<"$payload")
 
 # Git branch
 branch=""
@@ -30,19 +32,26 @@ dim=$'\033[2m'
 reset=$'\033[0m'
 sep=" ${dim}|${reset} "
 
-# Context 颜色和行动提示
+# Context 颜色
 if (( ctx_pct >= CTX_THRESHOLD_HIGH )); then
   ctx_color=$'\033[1;97;48;2;180;30;30m'
-  action=' 立即交接'
 elif (( ctx_pct >= CTX_THRESHOLD_MID )); then
   ctx_color=$'\033[1;30;48;2;255;140;0m'
-  action=' 准备交接'
 elif (( ctx_pct >= CTX_THRESHOLD_LOW )); then
   ctx_color=$'\033[1;30;48;2;255;235;130m'
-  action=' 留意用量'
 else
   ctx_color=$'\033[2m'
-  action=''
+fi
+
+# 行动提示：读 prompt hook 记录的档位（compact 后基线过高或压缩次数过多才会出现）
+action=''
+nudge_state="${HOME}/.claude/state/context-nudge-${session_id}.state"
+if [[ -n "$session_id" && -f "$nudge_state" ]]; then
+  nudge_level=$(sed -n 's/^level=//p' "$nudge_state")
+  case "$nudge_level" in
+    1) action=' 建议交接' ;;
+    2) action=' 立即交接' ;;
+  esac
 fi
 
 out="${blue}${model}${reset}"
