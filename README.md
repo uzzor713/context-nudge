@@ -2,7 +2,7 @@
 
 Claude Code 的 context 用量感知 + 会话交接工具。
 
-在 context 快用完之前**轻推提醒**你该交接了——不硬 block，不靠 AI 自觉，而是通过 hook 注入提示词 + 终端可视化双管齐下。
+自动压缩（compact）腾不出空间的时候**轻推提醒**你该交接了。只要压缩还管用就不打扰；提醒跟着你的下一条消息一起交给 Agent，由它在正常回答末尾顺带提一句，不会单独多回一轮。
 
 基于 [pwolbrycht/claude-code-handoff](https://github.com/pwolbrycht/claude-code-handoff)（MIT）改造，去掉了项目特定的功能，改为通用的中文提醒。
 
@@ -10,19 +10,28 @@ Claude Code 的 context 用量感知 + 会话交接工具。
 
 | 文件 | 作用 |
 |------|------|
-| `scripts/stop-hook-context-nudge.sh` | **Stop hook** — 每次 AI 回复后检查 context 百分比，超阈值打彩色药丸 + 注入 systemMessage |
-| `scripts/statusline-context.sh` | **Statusline** — 底栏常驻显示 context 百分比和行动提示 |
+| `scripts/prompt-hook-context-nudge.sh` | **UserPromptSubmit hook** — 每次你发消息时看压缩次数和压缩后基线，到档时把提醒附给 Agent |
+| `scripts/statusline-context.sh` | **Statusline** — 底栏常驻显示 context 百分比，到档时附上行动提示 |
 | `skills/handoff/SKILL.md` | **`/handoff` skill** — 生成交接摘要并复制到剪贴板 |
 
-## 三档提醒
+## 什么时候提醒
 
-| 阈值 | 药丸颜色 | 提示 | AI 行为 |
-|------|---------|------|---------|
-| 40% | 浅黄 | 留意用量 | 大任务时建议开新对话 |
-| 65% | 橙色 | 准备交接 | 提醒用户 `/handoff` |
-| 85% | 红色 | 立即交接 | 催促交接，拒绝接大任务 |
+每轮请求都会把系统提示、工具定义、CLAUDE.md 和整段对话历史重新发一遍，所以「当前 context」就是每轮带给 Agent 的总量。compact 会把它降回一个**基线**（固定开销 + 历史摘要 + 压缩后带回的文件、todo 等），之后接着涨。基线一次比一次高时，压缩能腾出的空间越来越少——这才是该换新对话的信号。第一次 compact 之前压缩还能兜底，不需要提醒。
 
-每档最多提醒 3 次，不会无限骚扰。升到更高档时重新开始计数。
+| 档位 | 条件（任一满足） | 提示 |
+|------|----------------|------|
+| 不提醒 | 还没 compact 过，或压缩后基线低 | — |
+| 建议交接 | 已 compact 2 次，或压缩后基线 ≥ 30% | 回答末尾建议在合适的节点 `/handoff` |
+| 立即交接 | 已 compact 3 次，或压缩后基线 ≥ 50% | 建议做完当前一小步就 `/handoff`，不再接新的大任务 |
+
+- **压缩后基线**：最近一次 compact 后第一次请求的 token 用量，占模型完整窗口的百分比。
+- 每档只提醒一次，升档时再提醒一次。
+- 以 `/` 开头的消息（比如 `/handoff`）不插话，留到下一条普通消息。
+- 关闭了自动压缩的会话不会触发提醒，只靠状态栏的百分比颜色。
+
+每个 Session 的状态保存在 `~/.claude/state/context-nudge-<session-id>.state`：`level` 是当前档位，`reminded_level` 是已提醒过的最高档，`compact_count`、`floor_pct`、`ctx_pct` 是最近一次的读数，`trigger_count` / `reminder_count` 是 hook 调用次数和实际提醒次数。
+
+运行 `bash tests/run.sh` 跑全部测试：`tests/prompt-hook.sh` 覆盖档位判定、提醒次数、基线取值、窗口判定和异常输入，`tests/statusline.sh` 覆盖颜色分档、行动提示和目录分支显示。
 
 ## 安装
 
@@ -36,8 +45,8 @@ Claude Code 的 context 用量感知 + 会话交接工具。
 ```bash
 # hook 脚本
 mkdir -p ~/.claude/scripts
-cp scripts/stop-hook-context-nudge.sh ~/.claude/scripts/
-chmod +x ~/.claude/scripts/stop-hook-context-nudge.sh
+cp scripts/prompt-hook-context-nudge.sh ~/.claude/scripts/
+chmod +x ~/.claude/scripts/prompt-hook-context-nudge.sh
 
 # handoff skill
 mkdir -p ~/.claude/skills/handoff
@@ -55,12 +64,12 @@ chmod +x ~/.claude/scripts/statusline-context.sh
 ```json
 {
   "hooks": {
-    "Stop": [
+    "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$HOME/.claude/scripts/stop-hook-context-nudge.sh\"",
+            "command": "bash \"$HOME/.claude/scripts/prompt-hook-context-nudge.sh\"",
             "timeout": 10
           }
         ]
@@ -78,17 +87,18 @@ chmod +x ~/.claude/scripts/statusline-context.sh
 
 ### 3. 集成到已有 statusline（可选）
 
-如果你有自己的 statusline 脚本，不需要替换，只需在显示 context 百分比的地方加上行动提示：
+如果你有自己的 statusline 脚本，不需要替换，只需读 hook 写的档位，在百分比后面加上行动提示：
 
 ```bash
-# 在你的 statusline.sh 中，计算出 pct_used 之后加上：
+# 在你的 statusline.sh 中加上（statusline 的 payload 带 session_id）：
+session_id=$(jq -r '.session_id // empty' <<<"$input")
 ctx_action=""
-if [ "$pct_used" -ge 85 ]; then
-    ctx_action=" 立即交接"
-elif [ "$pct_used" -ge 65 ]; then
-    ctx_action=" 准备交接"
-elif [ "$pct_used" -ge 40 ]; then
-    ctx_action=" 留意用量"
+nudge_state="$HOME/.claude/state/context-nudge-${session_id}.state"
+if [ -n "$session_id" ] && [ -f "$nudge_state" ]; then
+    case "$(sed -n 's/^level=//p' "$nudge_state")" in
+        1) ctx_action=" 建议交接" ;;
+        2) ctx_action=" 立即交接" ;;
+    esac
 fi
 # 然后在输出中追加 $ctx_action
 ```
@@ -107,30 +117,27 @@ fi
 
 ### 调整阈值
 
-编辑 `stop-hook-context-nudge.sh` 和 `statusline-context.sh` 顶部的变量：
+编辑 `prompt-hook-context-nudge.sh` 顶部的变量：
 
 ```bash
-CTX_THRESHOLD_LOW=40   # 第一档
-CTX_THRESHOLD_MID=65   # 第二档
-CTX_THRESHOLD_HIGH=85  # 第三档
+FLOOR_PCT_MID=30    # 压缩后基线达到多少进「建议交接」
+FLOOR_PCT_HIGH=50   # 压缩后基线达到多少进「立即交接」
+COMPACTS_MID=2      # compact 几次进「建议交接」
+COMPACTS_HIGH=3     # compact 几次进「立即交接」
 ```
 
-### 调整提醒次数
-
-在 hook 脚本中搜索 `< 3`，改成你想要的次数。
+`statusline-context.sh` 顶部的 `CTX_THRESHOLD_*` 只决定百分比的颜色。
 
 ### 修改提示语
 
-直接编辑 `pill=` 和 `sys_msg=` 行。`pill` 是给你看的终端提示，`sys_msg` 是注入给 AI 的系统消息。
+编辑 hook 里的 `user_msg=` 和 `agent_msg=`。`user_msg` 是终端里给你看的 `systemMessage`；`agent_msg` 是附给 Agent 的 `additionalContext`。
 
 ## 工作原理
 
-1. **Stop hook** 在每次 Claude 回复后触发。Stop hook 的 payload 不带 context 百分比，脚本从 transcript 末尾取最后一条主线回复的 token 用量（`input + cache_creation + cache_read`，与 statusline 口径一致；compact 之后取压缩后的用量），再按窗口大小换算：`settings.json` 的 `model` 或 `ANTHROPIC_MODEL` 带 `[1m]` 后缀按 1M 算，否则按 200k
-2. 超过阈值时，向 stderr 输出彩色药丸（你在终端看到），向 stdout 输出 JSON `{systemMessage: "..."}` （Claude 读到）
-3. **Statusline** 每次 prompt 时重新渲染，持续显示当前 context 百分比
+1. **UserPromptSubmit hook** 在你每次发消息时触发。脚本从 transcript 里找出真正的 `compact_boundary` 记录（对话内容里出现这个词不算），得到压缩次数；取最近一次 compact 后第一条主线回复的 token 用量（`input + cache_creation + cache_read`，跳过合成回复；还没有回复时用 `compactMetadata.postTokens`）作为基线，再按模型的完整窗口大小换算成百分比。`CLAUDE_CODE_DISABLE_1M_CONTEXT` 生效时按 200k，其他情况下按模型后缀和用量推测 200k 或 1M
+2. 进入新档位时，向 stdout 输出终端可见的 `systemMessage` 和附在你这条消息上的 `hookSpecificOutput.additionalContext`。Agent 处理你的消息时一并看到提醒，在回答末尾顺带一句，不会额外开一轮
+3. **Statusline** 持续显示当前 context 百分比，并读取状态文件里的档位显示行动提示
 4. **`/handoff` skill** 由用户手动触发，AI 盘点变更后生成交接摘要并复制到剪贴板
-
-两路提醒：药丸是主动弹出的告警，statusline 是被动的环境感知。systemMessage 让 AI 也知道 context 紧张，会在回复中配合提醒。
 
 ## 致谢
 
